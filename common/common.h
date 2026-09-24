@@ -601,6 +601,8 @@ struct common_params {
     int32_t  moe_stream_io_threads = 0;     // expert load I/O threads (<= 0 = default)
     uint32_t moe_stream_l2_gib     = 0;     // host-RAM tier below the VRAM slots, in GiB (0 = off)
     bool     moe_stream_direct     = false; // use O_DIRECT for expert reads (bypass page cache)
+    float    moe_stream_temp_max   = 0.0f;  // pace drive reads to hold the model drive at this temperature, C (0 = off)
+    float    moe_stream_read_max   = 0.0f;  // ceiling on expert reads from the drive, GB/s (0 = off)
 
     bool single_turn       = false; // single turn chat conversation
 

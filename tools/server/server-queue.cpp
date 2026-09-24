@@ -25,6 +25,7 @@ int server_queue::post(server_task && task, bool front) {
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
+        n_cancel_posted++;
     }
     const int task_id = task.id;
     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
@@ -47,6 +48,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
         // if this is cancel task make sure to clean up pending tasks
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
             cleanup_pending_task(task.id_target);
+            n_cancel_posted++;
         }
         QUE_DBG("new task, id = %d/%d, front = %d\n", task.id, (int) tasks.size(), front);
         if (front) {

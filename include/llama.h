@@ -337,6 +337,8 @@ extern "C" {
         uint64_t moe_stream_budget;     // total cache byte budget, used when slots == 0 (0 = auto heuristic)
         int32_t  moe_stream_io_threads; // expert load I/O threads (<= 0 = default)
         uint32_t moe_stream_l2_gib;     // host-RAM tier below the VRAM slots, in GiB (0 = off)
+        float    moe_stream_temp_max;   // pace drive reads to hold the model drive at this temperature, in C (0 = off)
+        float    moe_stream_read_max;   // ceiling on expert reads from the drive, in GB/s (0 = off)
         bool     moe_stream_direct;     // use O_DIRECT for expert reads (bypass page cache); falls back if unsupported
 
         // Keep the booleans together to avoid misalignment during copy-by-value.

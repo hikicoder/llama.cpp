@@ -694,6 +694,7 @@ struct llama_model {
     // MoE expert SSD streaming state, null when not enabled
     // the pointee is mutable (residency changes during decode), only the pointer is owned here
     llama_moe_stream * moe_stream() const;
+    llama_moe_stream * moe_stream_prefill() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

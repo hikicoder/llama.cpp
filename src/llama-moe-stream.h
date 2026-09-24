@@ -5,6 +5,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -42,6 +43,13 @@ enum llama_moe_stream_slot_state : uint8_t {
 // one streamed weight tensor (gate/up/down or fused gate_up) of one layer
 struct llama_moe_stream_weight {
     ggml_tensor * cache = nullptr; // cache tensor {ne0, ne1, n_slots}
+
+    // Prefill sweep target {ne0, ne1, n_expert}: a view of the shared pool where slot == expert id,
+    // so one ubatch's whole expert set for this layer is resident at once. Shared by every layer
+    // (same weight index), null when the pool could not be built.
+    ggml_tensor * region = nullptr;
+
+    ggml_backend_buffer_type_t buft = nullptr;
 
     uint16_t file_idx  = 0; // GGUF split file index
     size_t   offs      = 0; // file offset of the full exps tensor data
@@ -125,6 +133,9 @@ struct llama_moe_stream_layer {
     // (e.g. grovemoe evaluates a second, unstreamed expert group on the same layer index)
     bool matches(const ggml_tensor * gate, const ggml_tensor * up,
                  const ggml_tensor * down, const ggml_tensor * gate_up) const;
+
+    // the sweep region of the weight whose cache tensor is t; t itself when t is not one of ours
+    ggml_tensor * region_of(ggml_tensor * t) const;
 };
 
 // One queued read. ONE PER WEIGHT TENSOR, not one per expert.
@@ -158,6 +169,10 @@ struct llama_moe_stream_work {
     // time -- the router of layer L needs the output of L-1 -- so the drive never sees a queue
     // deeper than ~4 and gives 4,33 GB/s of the 10,04 it reaches at depth 6.
     bool     spec   = false;
+
+    // Prefill sweep: the slab lands in weights[weight].region at slot == expert. gen holds the
+    // sweep generation; an item from an aborted sweep is dropped instead of counted.
+    bool     sweep  = false;
 };
 
 // The smallest expert cache the multi-pass path can work with.
@@ -251,17 +266,23 @@ struct llama_moe_stream_l2 {
         uint8_t  ref  = 0;          // CLOCK reference bit: set on a hit, cleared by the hand
     };
 
-    uint8_t * base        = nullptr; // n_entries * slot_stride bytes
-    size_t    slot_stride = 0;       // max_nb_expert + 2*align, so any slab fits any slot
-    size_t    n_entries   = 0;
-    bool      pinned      = false;
+    std::vector<uint8_t *>               chunks;          // slot memory, slots_per_chunk slots each
+    std::vector<ggml_backend_buffer_ptr> chunk_bufs;      // the pinned chunks, when there are any
+    uint8_t *                            owned = nullptr; // pageable fallback, one allocation
+    size_t    slots_per_chunk = 0;
+    size_t    slot_stride     = 0;       // max_nb_expert + 2*align, so any slab fits any slot
+    size_t    n_entries       = 0;
+    bool      pinned          = false;
+
+    uint8_t * slot_ptr(size_t s) const {
+        return chunks[s/slots_per_chunk] + (s % slots_per_chunk)*slot_stride;
+    }
 
     std::vector<entry>                   entries;
     std::unordered_map<uint64_t, size_t> index; // key -> entry; only LOADING/RESIDENT are in it
     size_t                               next_victim = 0; // CLOCK hand
+    size_t                               free_hint   = 0; // no FREE entry below this index
     bool                                 clock       = true; // off = plain FIFO, for A/B
-
-    ggml_backend_buffer_ptr buf; // holds the pinned allocation when there is one
 
     mutable std::mutex mtx;
 
@@ -310,7 +331,10 @@ struct llama_moe_stream_l2 {
     // slab, or every slot is in flight. LOADING is itself the protection while the drive read and
     // the upload run; commit() is what ENDS that protection, so it must be called AFTER the
     // upload, never before.
-    uint8_t * reserve(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot);
+    // evict = false takes FREE slots only. A prefill sweep walks every layer in order and is larger
+    // than the tier, so letting it evict turns the tier into a FIFO that never hits; filling only
+    // free slots keeps the first part of the sweep resident for the next ubatch.
+    uint8_t * reserve(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot, bool evict = true);
     void      commit(size_t slot, size_t head);
     void      abandon(size_t slot);
 };
@@ -401,6 +425,58 @@ struct llama_moe_stream {
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> ctxs; // one per buft
     std::vector<ggml_backend_buffer_ptr> bufs;
 
+    // Shared device pool. Every layer's cache tensor is a view of n_slots slots in it, and the
+    // prefill region of each weight is a view of its first n_expert slots. A prefill pass only
+    // touches one layer at a time, so the whole budget is lent to that layer: it holds every
+    // expert the ubatch routes to and the expert GEMM runs once, instead of once per 6-expert wave.
+    // The decode caches that share slots with the region are dropped on each sweep and refill.
+    bool     sweep_enabled = false;
+    uint32_t pool_slots    = 0;
+    std::vector<ggml_context_ptr>          pool_ctxs;
+    std::vector<llama_moe_stream_layer *>  sweep_overlap; // layers whose decode slots sit inside the region
+    bool     sweep_l2_evict = false;  // LLAMA_MOE_STREAM_SWEEP_L2_EVICT=1: sweep fills may evict
+    uint64_t sweep_gen      = 0;      // current sweep; queued items from older sweeps are stale
+    int64_t  sweep_total    = 0;      // slabs of the current sweep
+    int64_t  sweep_done     = 0;      // of those, uploaded
+    int32_t  n_uploading    = 0;      // workers between claiming a pool write and finishing it
+    int64_t  t_sweep_end_us = 0;      // end of the previous sweep wait, for the gap between layers
+
+    ggml_backend_buffer_type_t host_buft = nullptr; // page-locked host memory of the cache device
+    ggml_backend_buffer_ptr    staging_buf;         // pinned per-worker staging, when available
+    size_t                     staging_stride = 0;
+
+    // Heat-aware pacing, off unless temp_max > 0 (--moe-stream-temp-max). A drive without airflow
+    // falls from 7.4 to ~0.5 GB/s once it throttles itself (measured at 74 C on a heatsinked NVMe without airflow);
+    // holding it just under that point keeps several GB/s sustained instead. A monitor thread
+    // reads the drive's hwmon sensor twice a second and moves an allowed read rate up or down;
+    // every drive read books its bytes against that rate first. Reads served from RAM never wait.
+    float                temp_max     = 0.0f;
+    double               read_max_bps = 0.0;    // fixed ceiling on drive reads (--moe-stream-read-max), 0 = none
+    std::string          temp_sensor;           // hwmon temp*_input of the model drive
+    std::thread          temp_thread;
+    std::mutex           pace_mtx;
+    std::condition_variable cv_temp;
+    double               pace_bps     = 0.0;    // allowed drive read rate in bytes/s, 0 = unpaced
+    int64_t              pace_next_us = 0;      // start of the current pacing slice
+    size_t               pace_used    = 0;      // bytes booked in the current slice
+    std::atomic<int32_t> temp_mc{-1};           // last reading, milli-C
+    std::atomic<int32_t> temp_peak_mc{-1};
+    std::atomic<int64_t> t_pace_us{0};          // time reads spent waiting for the rate
+    bool                 temp_stop    = false;  // guarded by pace_mtx
+
+    void start_thermal(const std::string & model_path);
+    void thermal_loop();
+    void pace_read(size_t bytes); // blocks until `bytes` of drive reads fit the allowed rate
+
+    // Set by the context (llama_set_abort_callback). Every wait on the drive polls it, so a
+    // cancelled request releases its slot instead of finishing the reads of a whole batch.
+    bool (*abort_cb)(void * data) = nullptr;
+    void *  abort_cb_data         = nullptr;
+    bool abort_requested() const { return abort_cb != nullptr && abort_cb(abort_cb_data); }
+
+    // builds the pool; false leaves the per-layer caches to be allocated one by one
+    bool build_pool(bool no_alloc);
+
     // load pool (queue and all layer residency state guarded by mtx)
     mutable std::mutex      mtx;
     std::condition_variable cv_work; // queued work or shutdown
@@ -434,7 +510,8 @@ struct llama_moe_stream {
     bool shutting_down   = false;
     bool load_failed     = false;
 
-    bool debug = false;
+    bool debug     = false;
+    bool sweep_log = false; // LLAMA_MOE_STREAM_SWEEP_LOG=1: one line per sweep (layer, experts, wait, GB/s)
 
     struct {
         int64_t n_calls     = 0; // remap invocations
@@ -452,6 +529,14 @@ struct llama_moe_stream {
         // no counter used to notice, which made every wait-share figure a lower bound.
         int64_t t_victim_us = 0; // wait time for a slot to free up
         int64_t n_victim_waits = 0; // how often that wait was entered at all
+
+        int64_t n_sweeps         = 0; // prefill sweep calls (one per layer per ubatch)
+        int64_t n_sweep_experts  = 0; // distinct experts over all sweeps
+        int64_t n_sweep_l2       = 0; // sweep slabs served from the host tier
+        int64_t n_sweep_disk     = 0; // sweep slabs read from the drive
+        int64_t t_sweep_us       = 0; // time the graph waited on sweep loads
+        int64_t t_sweep_gap_us   = 0; // time between one sweep's end and the next one's start
+        int64_t n_aborts         = 0; // waits cut short by the abort callback
 
         int64_t n_wave_calls     = 0; // wave-ids invocations (>= n_calls under multi-pass prefill)
         int64_t n_waves_run      = 0; // non-empty waves
@@ -483,12 +568,25 @@ struct llama_moe_stream {
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
-    void stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids); // make wave w resident + preload next
+    bool stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids); // make wave w resident + preload next; false on abort
+
+    // Sweep helpers (under mtx). begin drops stale sweep items, waits out any pool write still in
+    // flight and empties the decode slots the region overlaps; end is the abort cleanup.
+    void sweep_begin_locked(std::unique_lock<std::mutex> & lk);
+    void sweep_cancel_locked();
+
+    // Waits on cv_done until pred() holds, polling the abort callback. Returns false on abort.
+    template <typename Pred>
+    bool wait_or_abort(std::unique_lock<std::mutex> & lk, Pred pred);
     void emit_wave_slots(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int32_t w, uint32_t n_ids, int64_t n_tok); // write the slot ids
 };
 
 // callback of the id-remapping custom op inserted by build_moe_ffn
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+
+// Prefill sweep: loads every expert the ubatch routes to into the layer's region (slot == expert
+// id) and passes the ids through unchanged; the expert GEMMs then index the region tensors.
+void llama_moe_stream_sweep_ids(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
 
 // Adds mgr->route_bias to the selection logits of every expert this layer currently holds
 // (resident or loading), leaving masked-out entries at -inf untouched. Runs before top-k, so it

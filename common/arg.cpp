@@ -2744,6 +2744,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_L2"));
     add_opt(common_arg(
+        {"--moe-stream-temp-max"}, "C",
+        "heat-aware pacing for --moe-stream: hold the model drive at or below this temperature in "
+        "Celsius by slowing expert reads when it gets hot, instead of letting the drive throttle "
+        "itself (0 = off, default). Reads the drive's hwmon sensor; override the sensor with "
+        "LLAMA_MOE_STREAM_TEMP_SENSOR=<path to temp*_input>",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("must not be negative");
+            }
+            params.moe_stream = true;
+            params.moe_stream_temp_max = (float) value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_TEMP_MAX"));
+    add_opt(common_arg(
+        {"--moe-stream-read-max"}, "GB/s",
+        "ceiling on --moe-stream expert reads from the drive, in GB/s (0 = off, default). A drive "
+        "that overheats at full speed can run steadily below it; combine with --moe-stream-temp-max",
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f) {
+                throw std::invalid_argument("must not be negative");
+            }
+            params.moe_stream = true;
+            params.moe_stream_read_max = v;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_READ_MAX"));
+    add_opt(common_arg(
         {"--moe-stream-direct"},
         "use O_DIRECT for --moe-stream expert reads (bypass the page cache); implies --moe-stream. "
         "falls back to buffered reads if O_DIRECT is unsupported by the OS or filesystem",

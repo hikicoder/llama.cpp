@@ -1039,8 +1039,11 @@ struct llama_model::impl {
 
     bool has_tensor_overrides;
 
-    // MoE expert SSD streaming state, null when not enabled
+    // MoE expert SSD streaming state, null when not enabled.
+    // moe_stream_prefill is a second, host-memory cache used only while n_tokens > 1.
+    // Decode keeps the small device cache so the GPU can fetch one token's experts.
     std::unique_ptr<llama_moe_stream> moe_stream;
+    std::unique_ptr<llama_moe_stream> moe_stream_prefill;
 
     std::vector<float> tensor_split_owned;
 };
@@ -1350,7 +1353,24 @@ static bool llama_moe_stream_resolve_slots(const llama_model_params & params, co
         return true;
     }
 
-    const uint32_t n_min = llama_moe_stream_min_slots(hparams.n_expert_used);
+    // Layers that carry streamed experts. With the pooled prefill region, once every layer's slots
+    // together hold one layer's experts, prefill no longer needs 3*n_expert_used slots per layer
+    // (that was the wave plan) and decode needs n_expert_used plus some room to cache.
+    uint32_t n_layers_exps = 0;
+    for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
+        const std::string pfx = "blk." + std::to_string(il) + ".";
+        for (const char * sfx : { "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight", "ffn_gate_up_exps.weight" }) {
+            const auto it = ml.weights_map.find(pfx + sfx);
+            if (it != ml.weights_map.end() && it->second.tensor->ne[2] == hparams.n_expert) {
+                n_layers_exps++;
+                break;
+            }
+        }
+    }
+    const char * sweep_env = std::getenv("LLAMA_MOE_STREAM_SWEEP");
+    const bool   sweep_on  = sweep_env == nullptr || std::strtol(sweep_env, nullptr, 10) != 0;
+
+    uint32_t n_min = llama_moe_stream_min_slots(hparams.n_expert_used);
 
     uint32_t n_slots = params.moe_stream_slots;
     const char * source = "--moe-stream-cache <N>s";
@@ -1381,6 +1401,10 @@ static bool llama_moe_stream_resolve_slots(const llama_model_params & params, co
         LLAMA_LOG_WARN("%s: MoE expert cache of %u slots covers all %u experts -- streaming disabled, loading normally\n",
                 __func__, n_slots, hparams.n_expert);
         return true;
+    }
+
+    if (sweep_on && (uint64_t) n_slots*n_layers_exps >= hparams.n_expert) {
+        n_min = 2*hparams.n_expert_used;
     }
 
     if (n_slots < n_min) {
@@ -1497,6 +1521,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 LLAMA_LOG_WARN("%s: tensor buffer overrides (-ot/--cpu-moe) do not apply to SSD-streamed expert tensors\n", __func__);
             }
             pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct);
+            // Prefill cache lives in RAM. 72 slots is about 50 GiB on this model: big enough
+            // that one wave holds dozens of experts, so the drive sees a deep queue instead
+            // of six 6 MiB reads and a stall. Decode keeps n_slots on the device.
+            // Host prefill runs the expert GEMM on the CPU and caps this machine near 2 tok/s.
+            // Leave it off unless LLAMA_MOE_PREFILL_HOST=1. Decode and prefill both use the device cache.
+            const char * prefill_host = std::getenv("LLAMA_MOE_PREFILL_HOST");
+            const uint32_t n_prefill = std::min<uint32_t>(72, hparams.n_expert > 1 ? hparams.n_expert - 1 : 1);
+            if (prefill_host && prefill_host[0] == '1' &&
+                    n_prefill >= llama_moe_stream_min_slots(hparams.n_expert_used) && n_prefill > n_slots) {
+                pimpl->moe_stream_prefill = std::make_unique<llama_moe_stream>(n_layer_all, n_prefill, params.moe_stream_io_threads, params.moe_stream_direct);
+                LLAMA_LOG_INFO("%s: prefill expert cache = %u slots in host RAM, decode cache = %u slots\n",
+                        __func__, n_prefill, n_slots);
+            }
             // JigSaw: o orcamento de pins e clampado AQUI, onde n_expert_used existe. Um pin
             // rouba um slot ao pool dinamico e o plano de vagas exige 3*n_expert_used slots
             // dinamicos - sem este clamp o prefill entra em deadlock (medido 22/08, 24s-p8).
@@ -1515,6 +1552,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // that is quoted in its own results.
             if (params.moe_stream_l2_gib > 0) {
                 pimpl->moe_stream->l2_gib = params.moe_stream_l2_gib;
+            }
+            if (params.moe_stream_temp_max > 0.0f) {
+                pimpl->moe_stream->temp_max = params.moe_stream_temp_max;
+            }
+            if (params.moe_stream_read_max > 0.0f) {
+                pimpl->moe_stream->read_max_bps = params.moe_stream_read_max*1e9;
             }
             LLAMA_LOG_INFO("%s: MoE expert SSD streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
                     __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
@@ -1808,8 +1851,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->moe_stream.reset();
         } else {
             pimpl->moe_stream->alloc_bufs(ml.no_alloc);
+            const uint32_t n_min_waves = llama_moe_stream_min_slots(hparams.n_expert_used);
+            if (!pimpl->moe_stream->sweep_enabled && pimpl->moe_stream->n_slots < n_min_waves) {
+                throw std::runtime_error(format("MoE stream cache of %u slots needs the pooled prefill region, "
+                        "which could not be built; use --moe-stream-cache %us or more",
+                        pimpl->moe_stream->n_slots, n_min_waves));
+            }
             if (!ml.no_alloc) {
                 pimpl->moe_stream->open_files(ml.file_paths);
+            }
+        }
+    }
+
+    if (pimpl->moe_stream_prefill) {
+        if (pimpl->moe_stream_prefill->ctxs.empty()) {
+            pimpl->moe_stream_prefill.reset();
+        } else {
+            pimpl->moe_stream_prefill->alloc_bufs(ml.no_alloc);
+            if (!ml.no_alloc) {
+                pimpl->moe_stream_prefill->open_files(ml.file_paths);
             }
         }
     }
@@ -1888,7 +1948,12 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
                 throw std::runtime_error(format("failed to find a buffer type for streamed tensor %s", name.c_str()));
             }
 
-            return pimpl->moe_stream->create_cache_tensor(tn.bid, buft, w->tensor, w->idx, w->offs);
+            ggml_tensor * cache = pimpl->moe_stream->create_cache_tensor(tn.bid, buft, w->tensor, w->idx, w->offs);
+            if (pimpl->moe_stream_prefill) {
+                pimpl->moe_stream_prefill->create_cache_tensor(
+                        tn.bid, ggml_backend_cpu_buffer_type(), w->tensor, w->idx, w->offs);
+            }
+            return cache;
         }
     }
 
@@ -2241,6 +2306,10 @@ bool llama_model::has_tensor_overrides() const {
 
 llama_moe_stream * llama_model::moe_stream() const {
     return pimpl->moe_stream.get();
+}
+
+llama_moe_stream * llama_model::moe_stream_prefill() const {
+    return pimpl->moe_stream_prefill.get();
 }
 
 void llama_moe_stream_print_stats(const llama_model * model, const char * role) {
@@ -2686,6 +2755,8 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_budget           =*/ 0,
         /*.moe_stream_io_threads       =*/ 0,
         /*.moe_stream_l2_gib           =*/ 0,
+        /*.moe_stream_temp_max         =*/ 0.0f,
+        /*.moe_stream_read_max         =*/ 0.0f,
         /*.moe_stream_direct           =*/ false,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,

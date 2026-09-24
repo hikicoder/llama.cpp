@@ -792,6 +792,8 @@ struct llm_graph_params {
 
     // MoE expert SSD streaming state of the model, null when not enabled
     llama_moe_stream * mstream = nullptr;
+    // host-RAM cache used for prefill (n_tokens > 1); null keeps a single cache
+    llama_moe_stream * mstream_prefill = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1034,6 +1036,7 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     llama_moe_stream * mstream;
+    llama_moe_stream * mstream_prefill;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

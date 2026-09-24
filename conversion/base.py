@@ -1693,6 +1693,9 @@ class TextModel(ModelBase):
         if chkhsh == "972da7b59cec44d1f0a490a86c96df53859e486e481563e5dddac155013d87ac":
             # ref: https://huggingface.co/poolside/Laguna-XS.2
             res = "laguna"
+        if chkhsh == "b4b8ca1f9769494fbd956ebc4c249de6131fb277a4a3345a7a92c7dd7a55808d":
+            # ref: DeepSeek-V4.1-Flash (same three pre-tokenizer regexes as DeepSeek-V3; vocab ids differ)
+            res = "deepseek-v3"
 
         if res is None:
             logger.warning("\n")

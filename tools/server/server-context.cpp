@@ -997,6 +997,31 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // n_cancel_posted value of the last scan that found no cancel for a running task
+    int n_cancel_seen = 0;
+
+    // Abort callback of ctx_tgt. It runs on the thread inside llama_decode (the one that owns the
+    // slots), so reading slot state is safe; the queue itself is only read under its lock.
+    static bool decode_abort_cb(void * data) {
+        auto * self = (server_context_impl *) data;
+        const int n = self->queue_tasks.n_cancel_posted.load();
+        if (n == self->n_cancel_seen) {
+            return false;
+        }
+        const bool hit = self->queue_tasks.has_cancel_for([self](int id_target) {
+            for (const auto & slot : self->slots) {
+                if (slot.is_processing() && slot.task && slot.task->id == id_target) {
+                    return true;
+                }
+            }
+            return false;
+        });
+        if (!hit) {
+            self->n_cancel_seen = n;
+        }
+        return hit;
+    }
+
     void destroy() {
         spec.reset();
         spec_init.reset();
@@ -1224,6 +1249,9 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        // lets a client cancel stop a prompt that is still being decoded
+        llama_set_abort_callback(ctx_tgt, decode_abort_cb, this);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -3682,7 +3710,19 @@ private:
                     err = "Compute error.";
                 }
 
-                // TODO: handle ret == 2 (abort) when we start aborting
+                if (ret == 2) {
+                    // A client cancelled while this batch was decoding (decode_abort_cb). Part of the
+                    // batch never reached the memory, so no slot may keep claiming those tokens.
+                    SRV_WRN("decode aborted by a cancel, off = %d, n_batch = %d\n", off, n_batch);
+                    for (auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            slot.prompt_clear();
+                            send_error(slot, "request cancelled while its prompt was being processed", ERROR_TYPE_SERVER);
+                            slot.release();
+                        }
+                    }
+                    throw std::runtime_error("decode aborted by a cancel");
+                }
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);

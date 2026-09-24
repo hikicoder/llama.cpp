@@ -1154,6 +1154,14 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
     this->abort_callback      = abort_callback;
     this->abort_callback_data = abort_callback_data;
 
+    // streamed expert loads block inside a custom op; they poll this so an abort does not wait
+    // for the drive to finish the whole batch
+    if (auto * mstream = model.moe_stream()) {
+        std::lock_guard<std::mutex> lock(mstream->mtx);
+        mstream->abort_cb      = abort_callback;
+        mstream->abort_cb_data = abort_callback_data;
+    }
+
     for (auto & backend : backends) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
         if (reg) {
@@ -2385,7 +2393,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             res += lora->get_n_nodes();
         }
     }
-    if (const auto * mstream = model.moe_stream()) {
+    if (const auto * mstream = model.moe_stream(); mstream && !mstream->sweep_enabled) {
         // multi-pass streamed prefill adds a bounded number of extra nodes per wave per streamed
         //   layer. Same plan as build_moe_ffn, from the same function, so the budget cannot drift
         //   away from the graph it is budgeting for.
@@ -2483,7 +2491,8 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.mstream     =*/ model.moe_stream(),
+        /*.mstream          =*/ model.moe_stream(),
+        /*.mstream_prefill  =*/ model.moe_stream_prefill(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

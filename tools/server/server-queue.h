@@ -2,8 +2,10 @@
 
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <vector>
 #include <unordered_set>
@@ -54,6 +56,21 @@ public:
     bool is_sleeping() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return sleeping;
+    }
+
+    // Bumped on every posted cancel. The decode abort callback compares it against the last
+    // value it scanned, so it only takes the lock when a cancel has actually arrived.
+    std::atomic<int> n_cancel_posted{0};
+
+    // whether a queued cancel targets a task for which is_target(id) is true
+    bool has_cancel_for(const std::function<bool(int)> & is_target) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        for (const auto & task : queue_tasks) {
+            if (task.type == SERVER_TASK_TYPE_CANCEL && is_target(task.id_target)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // end the start_loop routine

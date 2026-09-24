@@ -94,8 +94,43 @@ and the MoE gate amplifies it because it is a switch (86.7 % of the top-6 choice
 6th-to-7th margin is about 1 %). The port is not reproducible across runs above ~1 024 tokens
 because expert-cache slot assignment depends on I/O timing; one I/O thread makes it bit-exact.
 
+## Prefill on a smaller GPU (this fork)
+
+This fork adds a faster prompt-processing path on top of the `dsv41-porte` branch, aimed at a
+~20 GB GPU. On a PCIe 4.0 NVMe, prefill went from 0.2-0.45 tokens/s in use (0.9-2.1 in short
+512-token tests) to 11-24 tokens/s, and generation from 0.9 to 1.9-2.0 tokens/s.
+
+- **One pass per layer instead of 6-expert waves.** The device expert caches of all layers are one
+  shared pool; each layer's decode cache is a slice of it. During prefill a layer borrows the pool as a
+  region with one slot per expert, so the whole ubatch's expert set is resident at once and the expert
+  GEMM runs once. All of the layer's reads are queued together in file order, which keeps the drive at
+  full rate (the wave path handed it 18 reads at a time, then stalled on an upload, a sync and a
+  masked GEMM). Decode keeps the per-layer caches. `LLAMA_MOE_STREAM_SWEEP=0` restores the wave path.
+- **Larger ubatches fit.** Non-flash attention runs in query chunks so the score matrix stays under
+  `LLAMA_ATTN_CHUNK_MIB` (default 1024). At 32k context the CUDA scratch at `-ub 2048` is 4340 MiB
+  (it was 8721 MiB at `-ub 512`), and each expert read now serves 2048 tokens.
+- **Cancel works mid-prompt.** A client cancel aborts the running decode, including the waits on the
+  drive, and frees the slot.
+- **Drive heat.** Sustained full-speed reads overheat a drive without airflow, and it then throttles
+  itself to ~0.5 GB/s. `--moe-stream-read-max <GB/s>` caps the read rate and `--moe-stream-temp-max <C>`
+  lowers it further to hold a temperature (read from the drive's hwmon sensor). Both are off by default.
+- The host tier (`--moe-stream-l2`) is pinned in 1 GiB chunks. `LLAMA_MOE_STREAM_SWEEP_LOG=1` prints
+  one line per layer per ubatch (experts, wait, GB/s, drive temperature).
+
+Example for a 20 GB GPU:
+
+```
+LLAMA_MOE_STREAM_SWEEP_LOG=1 llama-server -m DeepSeek-V4.1-Flash-MXFP4-engram.gguf \
+  -ngl 99 -c 32768 -nkvo -b 2048 -ub 2048 --parallel 1 \
+  -ot 'attn_output=CPU,attn_q_b=CPU,token_embd=CPU,output=CPU' \
+  --moe-stream --moe-stream-cache 12s --moe-stream-l2 32 --moe-stream-direct \
+  --moe-stream-read-max 3 --moe-stream-temp-max 70 --reasoning off
+```
+
 ## Credits
 
+- JigSawPT for the `dsv41-porte` branch this fork builds on: the DeepSeek-V4.1 port, the engram
+  tables, the host tier and the measurements behind them.
 - DeepSeek for the model and the reference implementation (MIT).
 - nibor1896 for Crow, whose `moe-stream` patch series is the base of the streaming path (MIT).
 - ggml-org/llama.cpp, whose `deepseek4`, `dflash` and speculative code this branch builds on.

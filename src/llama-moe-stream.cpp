@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -19,6 +20,9 @@
 #include <malloc.h>
 #else
 #include <fcntl.h>
+#include <glob.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #endif
 
@@ -160,16 +164,16 @@ static const uint8_t * llama_moe_stream_pread(llama_file & file, uint8_t * stagi
     (tier).t_lock_us += ggml_time_us() - _t_before;                    \
     (tier).n_lock_ops++;
 
-// The pinned allocation belongs to `buf` and frees itself; the fallback came from
+// The pinned chunks belong to `chunk_bufs` and free themselves; the pageable fallback came from
 // moe_aligned_alloc and does not.
 llama_moe_stream_l2::~llama_moe_stream_l2() {
-    if (base != nullptr && !buf) {
-        moe_aligned_free(base);
+    if (owned != nullptr) {
+        moe_aligned_free(owned);
     }
 }
 
 const uint8_t * llama_moe_stream_l2::find(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot) {
-    if (base == nullptr) {
+    if (n_entries == 0) {
         return nullptr;
     }
     const uint64_t key = make_key(file_idx, offs);
@@ -191,7 +195,7 @@ const uint8_t * llama_moe_stream_l2::find(uint16_t file_idx, size_t offs, size_t
     e.ref = 1;
     n_hit++;
     *out_slot = it->second;
-    return base + it->second*slot_stride + e.head;
+    return slot_ptr(it->second) + e.head;
 }
 
 void llama_moe_stream_l2::release(size_t slot) {
@@ -202,8 +206,8 @@ void llama_moe_stream_l2::release(size_t slot) {
     }
 }
 
-uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot) {
-    if (base == nullptr || len + 2*MOE_STREAM_DIRECT_ALIGN > slot_stride) {
+uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot, bool evict) {
+    if (n_entries == 0 || len + 2*MOE_STREAM_DIRECT_ALIGN > slot_stride) {
         return nullptr;
     }
     const uint64_t key = make_key(file_idx, offs);
@@ -211,6 +215,31 @@ uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t le
     L2_LOCK(*this);
     if (index.find(key) != index.end()) {
         return nullptr; // resident, or another worker is already filling it
+    }
+    if (!evict) {
+        // FREE slots only appear at startup and after abandon(), so a forward hint finds them
+        // without walking thousands of resident entries on every sweep read.
+        if (index.size() >= n_entries) {
+            return nullptr;
+        }
+        for (size_t s = free_hint; s < n_entries; s++) {
+            entry & e = entries[s];
+            if (e.st != FREE || e.pins > 0) {
+                continue;
+            }
+            e.key  = key;
+            e.len  = (uint32_t) len;
+            e.head = 0;
+            e.pins = 0;
+            e.ref  = 0;
+            e.st   = LOADING;
+            index[key] = s;
+            free_hint  = s + 1;
+            *out_slot  = s;
+            return slot_ptr(s);
+        }
+        free_hint = n_entries;
+        return nullptr;
     }
 
     // CLOCK (second chance): a slab hit since the hand last passed it survives one sweep. Two
@@ -242,13 +271,13 @@ uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t le
         index[key]  = s;
         next_victim = (s + 1) % n_entries;
         *out_slot   = s;
-        return base + s*slot_stride;
+        return slot_ptr(s);
     }
     return nullptr; // every slot is in flight
 }
 
 bool llama_moe_stream_l2::has(uint16_t file_idx, size_t offs, size_t len) {
-    if (base == nullptr) {
+    if (n_entries == 0) {
         return false;
     }
     const uint64_t key = make_key(file_idx, offs);
@@ -278,6 +307,7 @@ void llama_moe_stream_l2::abandon(size_t slot) {
     index.erase(e.key);
     e.key = UINT64_MAX;
     e.st  = FREE;
+    free_hint = std::min(free_hint, slot);
 }
 
 void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
@@ -304,30 +334,53 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
         tier->clock = std::strtol(s, nullptr, 10) != 0;
     }
 
-    const size_t bytes = n_l2 * stride;
-
+    // Pinned in 1 GiB chunks. The CUDA host type answers a refused pin by silently handing back
+    // pageable memory for the whole request; with chunks, a refusal only ends the tier at that point
+    // and everything before it stays page-locked.
+    const size_t chunk_slots = std::max<size_t>(1, (1024ull*1024*1024)/stride);
     if (host_buft != nullptr) {
-        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(host_buft, bytes);
-        if (b != nullptr) {
-            tier->buf.reset(b);
-            tier->base   = (uint8_t *) ggml_backend_buffer_get_base(b);
-            tier->pinned = true;
+        for (size_t s0 = 0; s0 < n_l2; s0 += chunk_slots) {
+            const size_t n = std::min(chunk_slots, n_l2 - s0);
+            ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(host_buft, n*stride);
+            if (b == nullptr) {
+                break;
+            }
+            // the CUDA host type falls back to a plain CPU buffer when the driver cannot pin
+            if (ggml_backend_buffer_get_type(b) != host_buft) {
+                ggml_backend_buffer_free(b);
+                break;
+            }
+            tier->chunks.push_back((uint8_t *) ggml_backend_buffer_get_base(b));
+            tier->chunk_bufs.emplace_back(b);
+        }
+        if (!tier->chunks.empty()) {
+            tier->slots_per_chunk = chunk_slots;
+            tier->pinned          = true;
+            const size_t n_pinned = std::min(n_l2, tier->chunks.size()*chunk_slots);
+            if (n_pinned < n_l2) {
+                LLAMA_LOG_WARN("%s: the driver pinned only %.2f of %.2f GiB for the L2 tier; keeping the pinned part\n",
+                        __func__, n_pinned*stride/1024.0/1024.0/1024.0, n_l2*stride/1024.0/1024.0/1024.0);
+            }
+            tier->n_entries = n_pinned;
         }
     }
-    if (tier->base == nullptr) {
+    if (tier->chunks.empty()) {
         // Not a failure: the tier still removes the SSD read, it just uploads at pageable rates.
         // Which one is in force is printed, because a run that silently fell back would report the
         // slower number as this tier's.
-        tier->base = (uint8_t *) moe_aligned_alloc(bytes);
-        if (tier->base == nullptr) {
+        tier->owned = (uint8_t *) moe_aligned_alloc(n_l2*stride);
+        if (tier->owned == nullptr) {
             LLAMA_LOG_WARN("%s: could not allocate %.2f GiB for the L2 tier - tier not created\n",
-                    __func__, bytes/1024.0/1024.0/1024.0);
+                    __func__, n_l2*stride/1024.0/1024.0/1024.0);
             return;
         }
+        tier->chunks.push_back(tier->owned);
+        tier->slots_per_chunk = n_l2;
     }
 
-    tier->entries.resize(n_l2);
-    tier->index.reserve(n_l2*2);
+    const size_t bytes = tier->n_entries*stride;
+    tier->entries.resize(tier->n_entries);
+    tier->index.reserve(tier->n_entries*2);
 
     // WARN and not INFO, and that is a deliberate misuse of the level. At the default verbosity
     // llama-server prints no INFO from this library at all - measured 2026-08-09, the whole load
@@ -339,7 +392,7 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
             __func__, bytes/1024.0/1024.0/1024.0,
             tier->pinned ? "PINNED (page-locked, unavailable to the rest of the system)"
                          : "PAGEABLE (no host buffer type - uploads stay at pageable rates)",
-            n_l2, stride, tier->clock ? "CLOCK" : "FIFO");
+            tier->n_entries, stride, tier->clock ? "CLOCK" : "FIFO");
 
     l2 = std::move(tier);
 }
@@ -369,6 +422,15 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
     return n > 0 && n == weights.size();
 }
 
+ggml_tensor * llama_moe_stream_layer::region_of(ggml_tensor * t) const {
+    for (const auto & w : weights) {
+        if (t != nullptr && w.cache == t) {
+            return w.region;
+        }
+    }
+    return t;
+}
+
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
 llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct) : n_slots(n_slots) {
     layers.resize(n_layer);
@@ -395,6 +457,7 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
     }
 
     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
+    sweep_log     = std::getenv("LLAMA_MOE_STREAM_SWEEP_LOG") != nullptr;
     use_direct_io = direct;
 
     // Router bias toward resident experts. Read once here rather than per call so a run cannot
@@ -418,6 +481,14 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
 
 // stop and join the I/O workers before the cache buffers and files they use are destroyed
 llama_moe_stream::~llama_moe_stream() {
+    {
+        std::lock_guard<std::mutex> lock(pace_mtx);
+        temp_stop = true;
+    }
+    cv_temp.notify_all();
+    if (temp_thread.joinable()) {
+        temp_thread.join();
+    }
     {
         std::lock_guard<std::mutex> lock(mtx);
         shutting_down = true;
@@ -514,15 +585,154 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
     }
     GGML_ASSERT(sl->n_expert == n_expert);
 
-    sl->weights.push_back({ cache, file_idx, offs, nb_expert });
+    llama_moe_stream_weight wt;
+    wt.cache     = cache;
+    wt.buft      = buft;
+    wt.file_idx  = file_idx;
+    wt.offs      = offs;
+    wt.nb_expert = nb_expert;
+    sl->weights.push_back(wt);
 
     max_nb_expert = std::max(max_nb_expert, nb_expert);
 
     return cache;
 }
 
+bool llama_moe_stream::build_pool(bool no_alloc) {
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_SWEEP")) {
+        if (std::strtol(s, nullptr, 10) == 0) {
+            return false;
+        }
+    }
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_SWEEP_L2_EVICT")) {
+        sweep_l2_evict = std::strtol(s, nullptr, 10) != 0;
+    }
+
+    std::vector<llama_moe_stream_layer *> sls;
+    for (auto & sl : layers) {
+        if (sl) {
+            sls.push_back(sl.get());
+        }
+    }
+    if (sls.empty()) {
+        return false;
+    }
+
+    // every streamed layer must share the shape of each weight, or one region cannot serve them all
+    const size_t   n_w      = sls[0]->weights.size();
+    const uint32_t n_expert = sls[0]->n_expert;
+    for (const auto * sl : sls) {
+        if (sl->weights.size() != n_w || sl->n_expert != n_expert || sl->n_slots != n_slots) {
+            return false;
+        }
+        for (size_t w = 0; w < n_w; w++) {
+            const ggml_tensor * a = sls[0]->weights[w].cache;
+            const ggml_tensor * b = sl->weights[w].cache;
+            if (a->type != b->type || a->ne[0] != b->ne[0] || a->ne[1] != b->ne[1] ||
+                    sls[0]->weights[w].buft != sl->weights[w].buft) {
+                return false;
+            }
+        }
+    }
+
+    const uint64_t n_pool = (uint64_t) sls.size() * n_slots;
+    if (n_pool < n_expert) {
+        LLAMA_LOG_WARN("%s: moe stream: %" PRIu64 " pooled slots cannot hold one layer's %u experts; "
+                "prefill keeps the wave path\n", __func__, n_pool, n_expert);
+        return false;
+    }
+
+    // one pool per weight index; all pools of one buft live in one context
+    std::vector<ggml_tensor *> pools(n_w, nullptr);
+    std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context *>> pctx;
+    for (size_t w = 0; w < n_w; w++) {
+        ggml_backend_buffer_type_t buft = sls[0]->weights[w].buft;
+        ggml_context * ctx = nullptr;
+        for (auto & [b, c] : pctx) {
+            if (b == buft) {
+                ctx = c;
+            }
+        }
+        if (ctx == nullptr) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead()*(2*n_w + 1),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ctx = ggml_init(params);
+            if (ctx == nullptr) {
+                throw std::runtime_error("failed to create ggml context for the MoE stream pool");
+            }
+            pool_ctxs.emplace_back(ctx);
+            pctx.emplace_back(buft, ctx);
+        }
+        const ggml_tensor * ref = sls[0]->weights[w].cache;
+        ggml_tensor * pool = ggml_new_tensor_3d(ctx, ref->type, ref->ne[0], ref->ne[1], (int64_t) n_pool);
+        ggml_format_name(pool, "moe_pool_%zu.stream_cache", w);
+        ggml_tensor * region = ggml_view_3d(ctx, pool, ref->ne[0], ref->ne[1], n_expert, pool->nb[1], pool->nb[2], 0);
+        ggml_format_name(region, "moe_region_%zu.stream_cache", w);
+        pools[w] = pool;
+        for (auto * sl : sls) {
+            sl->weights[w].region = region;
+        }
+    }
+
+    for (auto & [buft, ctx] : pctx) {
+        ggml_backend_buffer_t buf;
+        if (no_alloc) {
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                t->buffer = buf;
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            if (buf == nullptr) {
+                throw std::runtime_error(format("unable to allocate %s buffer for the MoE stream pool", ggml_backend_buft_name(buft)));
+            }
+            // quantized GEMM kernels may read a little past a row; a never-loaded slot must hold
+            // finite bytes (zero) rather than whatever the allocator handed out
+            ggml_backend_buffer_clear(buf, 0);
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        bufs.emplace_back(buf);
+
+        LLAMA_LOG_INFO("%s: %12s expert pool size = %8.2f MiB (%" PRIu64 " slots = %zu layers x %u, "
+                "prefill region %u)\n", __func__, ggml_backend_buffer_name(buf),
+                ggml_backend_buffer_get_size(buf)/1024.0/1024.0, n_pool, sls.size(), n_slots, n_expert);
+    }
+
+    // the per-layer caches become views of their slice of the pool
+    for (size_t r = 0; r < sls.size(); r++) {
+        auto * sl = sls[r];
+        for (size_t w = 0; w < n_w; w++) {
+            ggml_tensor * t = sl->weights[w].cache;
+            if (no_alloc) {
+                t->buffer = pools[w]->buffer;
+                continue;
+            }
+            t->view_src  = pools[w];
+            t->view_offs = r*n_slots*sl->weights[w].nb_expert;
+            if (ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("failed to map a MoE stream cache into the pool");
+            }
+        }
+        if ((uint64_t) r*n_slots < n_expert) {
+            sweep_overlap.push_back(sl);
+        }
+    }
+
+    pool_slots    = (uint32_t) n_pool;
+    sweep_enabled = true;
+    return true;
+}
+
 void llama_moe_stream::alloc_bufs(bool no_alloc) {
+    const bool pooled = build_pool(no_alloc);
+
     for (auto & [buft, ctx_ptr] : ctxs) {
+        if (pooled) {
+            break;
+        }
         ggml_context * ctx = ctx_ptr.get();
         if (ggml_get_first_tensor(ctx) == nullptr) {
             continue;
@@ -549,10 +759,10 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
 
     // The host tier is allocated here and not in the constructor: max_nb_expert only exists once
     // every weight has been registered, and the slot size is derived from it.
-    if (!no_alloc && l2_gib > 0) {
+    if (!no_alloc) {
         // Page-locked memory belongs to whichever backend owns the cache tensors, so the device
         // comes from their own buffer type rather than being assumed to be device 0.
-        ggml_backend_buffer_type_t host_buft = nullptr;
+        host_buft = nullptr;
         for (auto & [buft, ctx_ptr] : ctxs) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             if (dev != nullptr) {
@@ -562,7 +772,9 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
                 }
             }
         }
-        alloc_l2(host_buft);
+        if (l2_gib > 0) {
+            alloc_l2(host_buft);
+        }
     }
 }
 
@@ -606,6 +818,13 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         LLAMA_LOG_INFO("%s: MoE expert streaming uses O_DIRECT (page cache bypassed)\n", __func__);
     }
 
+    if (read_max_bps > 0.0) {
+        LLAMA_LOG_WARN("%s: expert reads from the drive capped at %.2f GB/s\n", __func__, read_max_bps/1e9);
+    }
+    if (temp_max > 0.0f && !paths.empty()) {
+        start_thermal(paths[0]);
+    }
+
     // one token drives ~one remap per streamed layer, so decaying every 64 tokens is
     //   64 * n_streamed_layers remap calls (computed once here, off the hot path)
     int64_t n_streamed = 0;
@@ -613,6 +832,172 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         n_streamed += sl != nullptr;
     }
     hot_decay_interval = MOE_STREAM_HOT_DECAY_TOKENS * n_streamed;
+}
+
+// hwmon temp*_input holds milli-Celsius; -1 when unreadable
+static int32_t moe_read_temp_mc(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "r");
+    if (f == nullptr) {
+        return -1;
+    }
+    long v = -1;
+    if (fscanf(f, "%ld", &v) != 1) {
+        v = -1;
+    }
+    fclose(f);
+    return (int32_t) v;
+}
+
+// The drive's own sensor: file -> block device -> whole disk -> its controller's hwmon.
+// NVMe exposes it as <disk>/device/hwmonN, SATA (drivetemp) as <disk>/device/hwmon/hwmonN.
+static std::string moe_find_drive_sensor(const std::string & file) {
+#ifdef _WIN32
+    GGML_UNUSED(file);
+    return "";
+#else
+    struct stat st;
+    if (stat(file.c_str(), &st) != 0) {
+        return "";
+    }
+    char link[64];
+    snprintf(link, sizeof(link), "/sys/dev/block/%u:%u", major(st.st_dev), minor(st.st_dev));
+    char * real = realpath(link, nullptr);
+    if (real == nullptr) {
+        return "";
+    }
+    std::string dev = real;
+    free(real);
+    if (access((dev + "/partition").c_str(), F_OK) == 0) {
+        dev = dev.substr(0, dev.rfind('/'));
+    }
+    std::string found;
+    for (const char * pat : { "/device/hwmon*/temp1_input", "/device/hwmon/hwmon*/temp1_input" }) {
+        glob_t g;
+        if (glob((dev + pat).c_str(), 0, nullptr, &g) == 0 && g.gl_pathc > 0) {
+            found = g.gl_pathv[0];
+        }
+        globfree(&g);
+        if (!found.empty()) {
+            break;
+        }
+    }
+    return found;
+#endif
+}
+
+void llama_moe_stream::start_thermal(const std::string & model_path) {
+    const char * s = std::getenv("LLAMA_MOE_STREAM_TEMP_SENSOR");
+    temp_sensor = s ? std::string(s) : moe_find_drive_sensor(model_path);
+    const int32_t mc = temp_sensor.empty() ? -1 : moe_read_temp_mc(temp_sensor);
+    if (mc < 0) {
+        LLAMA_LOG_WARN("%s: no readable temperature sensor for the model drive; heat-aware pacing off "
+                "(set LLAMA_MOE_STREAM_TEMP_SENSOR to a hwmon temp*_input)\n", __func__);
+        temp_max = 0.0f;
+        return;
+    }
+    temp_mc      = mc;
+    temp_peak_mc = mc;
+    LLAMA_LOG_WARN("%s: heat-aware pacing on: holding the model drive at %.0f C (now %.1f C, sensor %s)\n",
+            __func__, temp_max, mc/1000.0, temp_sensor.c_str());
+    temp_thread = std::thread([this]() { thermal_loop(); });
+}
+
+// Integral control on the read rate: below the target it climbs 5 % per degree of headroom per
+// step until it is unpaced again; above it, it drops 10 % per degree over, at most halving in one
+// step. The error is taken on where the temperature is heading, not where it is: at full speed the
+// test drive heats about 1 C per second and keeps rising for seconds after reads slow, so
+// reacting to the reading alone overshot 68 C to 75 C and pinned the rate at its floor.
+// (Measurements in this block: a PCIe 4.0 NVMe with a passive heatsink and no airflow.)
+void llama_moe_stream::thermal_loop() {
+    // above what the drive can do, or the fixed ceiling: reaching it means the temperature is not
+    // what limits reads
+    const double max_bps  = read_max_bps > 0.0 ? read_max_bps : 8e9;
+    const double min_bps  = std::min(0.25e9, max_bps); // below the drive's own throttled rate; never starve decode
+    const double lead_s   = 6.0;    // how far ahead the slope is projected
+
+    double  slope   = 0.0;          // C/s, smoothed
+    int32_t prev_mc = -1;
+    int64_t prev_us = 0;
+
+    std::unique_lock<std::mutex> lk(pace_mtx);
+    while (!temp_stop) {
+        cv_temp.wait_for(lk, std::chrono::milliseconds(500));
+        if (temp_stop) {
+            break;
+        }
+        lk.unlock();
+        const int32_t mc     = moe_read_temp_mc(temp_sensor);
+        const int64_t now_us = ggml_time_us();
+        lk.lock();
+        if (mc < 0) {
+            continue;
+        }
+        temp_mc = mc;
+        if (mc > temp_peak_mc) {
+            temp_peak_mc = mc;
+        }
+        if (prev_mc >= 0 && now_us > prev_us) {
+            const double s = (mc - prev_mc)/1000.0/((now_us - prev_us)/1e6);
+            slope = 0.7*slope + 0.3*s;
+        }
+        prev_mc = mc;
+        prev_us = now_us;
+
+        const double err = temp_max - (mc/1000.0 + lead_s*std::max(0.0, slope));
+        const double was = pace_bps;
+        double r = was > 0.0 ? was : max_bps;
+        if (err < 0.0) {
+            r *= std::max(0.5, 1.0 + 0.10*err);
+        } else if (was > 0.0) {
+            r *= 1.0 + 0.05*std::min(err, 10.0);
+        }
+        r = std::min(std::max(r, min_bps), max_bps);
+        pace_bps = r >= max_bps ? 0.0 : r;
+
+        if (was == 0.0 && pace_bps > 0.0) {
+            LLAMA_LOG_WARN("moe stream: model drive at %.1f C, pacing reads (%.2f GB/s)\n", mc/1000.0, pace_bps/1e9);
+        } else if (was > 0.0 && pace_bps == 0.0) {
+            LLAMA_LOG_WARN("moe stream: model drive at %.1f C, pacing off\n", mc/1000.0);
+        }
+    }
+}
+
+// Pacing works in coarse time slices: each slice lets rate*slice bytes through at the drive's full
+// speed, then everything waits for the next slice. Spacing single reads evenly instead (one 6 MiB
+// read every ~2 ms at 3 GB/s) made the reads and GPU uploads switch on and off at ~500 Hz, and the
+// test machine's power stages sang along audibly. At two slices per second the on/off rhythm is
+// below hearing, and the drive's temperature, which moves over seconds, sees the same average.
+void llama_moe_stream::pace_read(size_t bytes) {
+    if (temp_max <= 0.0f && read_max_bps <= 0.0) {
+        return;
+    }
+    const int64_t slice_us = 500000;
+    std::unique_lock<std::mutex> lk(pace_mtx);
+    while (true) {
+        double rate = read_max_bps;
+        if (pace_bps > 0.0 && (rate <= 0.0 || pace_bps < rate)) {
+            rate = pace_bps;
+        }
+        if (rate <= 0.0 || temp_stop) {
+            return;
+        }
+        const int64_t now = ggml_time_us();
+        if (now >= pace_next_us + slice_us) {
+            pace_next_us = now; // start of the current slice
+            pace_used    = 0;
+        }
+        const double budget = rate*slice_us/1e6;
+        // a read larger than a whole slice's budget still goes through at the start of a slice
+        if (pace_used == 0 || (double) (pace_used + bytes) <= budget) {
+            pace_used += bytes;
+            return;
+        }
+        const int64_t wake = pace_next_us + slice_us;
+        lk.unlock();
+        std::this_thread::sleep_for(std::chrono::microseconds(wake - now));
+        t_pace_us += wake - now;
+        lk.lock();
+    }
 }
 
 // spawn the I/O thread pool on first use (from the remap callback, under mtx)
@@ -631,9 +1016,69 @@ void llama_moe_stream::start_workers_locked() {
     if (n_spec_workers_from < 0) {
         n_spec_workers_from = 0;
     }
+    // Staging is where a slab lands when the host tier does not take it. Pageable staging makes
+    // every such upload a driver bounce copy; page-locked staging lets it DMA at full link speed.
+    staging_stride = max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN;
+    staging_stride = (staging_stride + MOE_STREAM_DIRECT_ALIGN - 1) & ~(MOE_STREAM_DIRECT_ALIGN - 1);
+    if (host_buft != nullptr) {
+        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(host_buft,
+                (size_t) n_io_threads*staging_stride + MOE_STREAM_DIRECT_ALIGN);
+        if (b != nullptr) {
+            staging_buf.reset(b);
+        }
+    }
     workers.reserve(n_io_threads);
     for (int32_t i = 0; i < n_io_threads; i++) {
         workers.emplace_back([this, i]() { worker_loop((int) i); });
+    }
+}
+
+template <typename Pred>
+bool llama_moe_stream::wait_or_abort(std::unique_lock<std::mutex> & lk, Pred pred) {
+    if (abort_cb == nullptr) {
+        cv_done.wait(lk, pred);
+        return true;
+    }
+    while (!pred()) {
+        cv_done.wait_for(lk, std::chrono::milliseconds(20));
+        if (!pred() && abort_requested()) {
+            stats.n_aborts++;
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_moe_stream::sweep_cancel_locked() {
+    q_demand.erase(std::remove_if(q_demand.begin(), q_demand.end(),
+            [](const llama_moe_stream_work & w) { return w.sweep; }), q_demand.end());
+    sweep_gen++;
+}
+
+void llama_moe_stream::sweep_begin_locked(std::unique_lock<std::mutex> & lk) {
+    sweep_cancel_locked();
+
+    // A write still headed for the pool - a stale sweep item, or a decode load whose slot sits
+    // inside the region - would land on top of this sweep's experts. Let it finish first.
+    cv_done.wait(lk, [&]{ return n_uploading == 0 || load_failed; });
+
+    for (auto * sl : sweep_overlap) {
+        for (uint32_t s = 0; s < sl->n_slots; s++) {
+            if (sl->slot_expert[s] < 0 && sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_EMPTY) {
+                continue;
+            }
+            if (sl->slot_expert[s] >= 0) {
+                sl->expert_slot.erase(sl->slot_expert[s]);
+            }
+            sl->slot_expert[s]     = -1;
+            sl->slot_state[s]      = LLAMA_MOE_STREAM_SLOT_EMPTY;
+            sl->slot_gen[s]++;
+            sl->slot_parts_left[s] = 0;
+            sl->slot_claimed[s]    = 0;
+            if (!sl->slot_pinned.empty()) {
+                sl->slot_pinned[s] = 0;
+            }
+        }
     }
 }
 
@@ -642,8 +1087,17 @@ void llama_moe_stream::start_workers_locked() {
 void llama_moe_stream::worker_loop(int worker_id) {
     // page-aligned staging (Metal private buffers require page-aligned source + page-multiple
     // length; O_DIRECT needs the extra head/tail slack for its aligned reads)
-    uint8_t * staging = (uint8_t *) moe_aligned_alloc(max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN);
-    GGML_ASSERT(staging != nullptr);
+    uint8_t * staging       = nullptr;
+    uint8_t * staging_owned = nullptr;
+    if (staging_buf) {
+        uintptr_t p = (uintptr_t) ggml_backend_buffer_get_base(staging_buf.get());
+        p = (p + MOE_STREAM_DIRECT_ALIGN - 1) & ~(uintptr_t) (MOE_STREAM_DIRECT_ALIGN - 1);
+        staging = (uint8_t *) p + (size_t) worker_id*staging_stride;
+    } else {
+        staging_owned = (uint8_t *) moe_aligned_alloc(max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN);
+        GGML_ASSERT(staging_owned != nullptr);
+        staging = staging_owned;
+    }
 
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
@@ -685,6 +1139,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
                 size_t    slot_l2 = 0;
                 uint8_t * dst = l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2);
                 if (dst != nullptr) {
+                    pace_read(wt.nb_expert);
                     const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], dst,
                             wt.nb_expert, offs, use_direct_io, worker_id);
                     if (data == nullptr) {
@@ -706,6 +1161,66 @@ void llama_moe_stream::worker_loop(int worker_id) {
             }
             continue;
         }
+        if (w.sweep) {
+            if (w.gen != sweep_gen) {
+                continue; // left over from an aborted sweep
+            }
+            n_uploading++;
+            lk.unlock();
+
+            const auto & wt   = sl.weights[w.weight];
+            const size_t offs = wt.offs + (size_t) w.expert*wt.nb_expert;
+
+            size_t pinned_slot = SIZE_MAX;
+            size_t filled_slot = SIZE_MAX;
+            size_t filled_head = 0;
+
+            const uint8_t * data = l2 ? l2->find(wt.file_idx, offs, wt.nb_expert, &pinned_slot) : nullptr;
+            const bool from_l2 = data != nullptr;
+            if (data == nullptr) {
+                size_t    slot_l2 = 0;
+                uint8_t * dst     = l2 ? l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2, sweep_l2_evict) : nullptr;
+                pace_read(wt.nb_expert);
+                data = llama_moe_stream_pread(*files[wt.file_idx], dst ? dst : staging,
+                        wt.nb_expert, offs, use_direct_io, worker_id);
+                if (dst != nullptr) {
+                    if (data == nullptr) {
+                        l2->abandon(slot_l2);
+                    } else {
+                        filled_slot = slot_l2;
+                        filled_head = (size_t) (data - dst);
+                    }
+                }
+            }
+            const bool ok = data != nullptr;
+            if (ok) {
+                {
+                    std::lock_guard<std::mutex> up(upload_mtx);
+                    ggml_backend_tensor_set(wt.region, data, (size_t) w.expert*wt.nb_expert, wt.nb_expert);
+                }
+                if (filled_slot != SIZE_MAX) {
+                    l2->commit(filled_slot, filled_head);
+                }
+            }
+            if (pinned_slot != SIZE_MAX) {
+                l2->release(pinned_slot);
+            }
+
+            lk.lock();
+            n_uploading--;
+            if (!ok) {
+                load_failed = true;
+            } else if (w.gen == sweep_gen) {
+                sweep_done++;
+                if (from_l2) {
+                    stats.n_sweep_l2++;
+                } else {
+                    stats.n_sweep_disk++;
+                }
+            }
+            cv_done.notify_all();
+            continue;
+        }
         const uint8_t bit = (w.weight >= 0 && w.weight < 8) ? (uint8_t) (1u << w.weight) : 0u;
         if (w.gen != sl.slot_gen[w.slot] ||
             sl.slot_state[w.slot] != LLAMA_MOE_STREAM_SLOT_LOADING ||
@@ -718,6 +1233,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
             continue;
         }
         sl.slot_claimed[w.slot] |= bit;
+        n_uploading++;
 
         lk.unlock();
 
@@ -745,6 +1261,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
                 size_t    slot_l2 = 0;
                 uint8_t * dst     = l2 ? l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2) : nullptr;
 
+                pace_read(wt.nb_expert);
                 data = llama_moe_stream_pread(*files[wt.file_idx], dst ? dst : staging,
                         wt.nb_expert, offs, use_direct_io, worker_id);
 
@@ -783,6 +1300,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
         }
 
         lk.lock();
+        n_uploading--;
 
         // Re-check the generation: this worker held no lock while reading, and the
         // slot may have been evicted and re-reserved for another expert meanwhile.
@@ -805,7 +1323,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
     }
     lk.unlock();
 
-    moe_aligned_free(staging);
+    moe_aligned_free(staging_owned);
 }
 
 // least valuable evictable slot: empty first, then coldest resident (min route hotness, oldest use
@@ -1128,6 +1646,21 @@ void llama_moe_stream::print_stats(const char * role) const {
         LLAMA_LOG_INFO("%s: %smoe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
                 __func__, pfx, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
     }
+    if (stats.n_sweeps > 0) {
+        const double gb = stats.n_sweep_disk*(double) max_nb_expert/1e9;
+        LLAMA_LOG_WARN("%s: %smoe stream: prefill sweeps = %" PRId64 " (%.1f experts each), slabs from host = %" PRId64
+                ", from drive = %" PRId64 " (%.1f GB), sweep wait = %.2f s (%.2f GB/s), gap between layers = %.2f s\n",
+                __func__, pfx, stats.n_sweeps, (double) stats.n_sweep_experts/stats.n_sweeps,
+                stats.n_sweep_l2, stats.n_sweep_disk, gb, stats.t_sweep_us/1e6,
+                stats.t_sweep_us > 0 ? gb/(stats.t_sweep_us/1e6) : 0.0, stats.t_sweep_gap_us/1e6);
+    }
+    if (stats.n_aborts > 0) {
+        LLAMA_LOG_WARN("%s: %smoe stream: %" PRId64 " waits cut short by an abort\n", __func__, pfx, stats.n_aborts);
+    }
+    if (temp_max > 0.0f || read_max_bps > 0.0) {
+        LLAMA_LOG_WARN("%s: %smoe stream: pacing: cap %.2f GB/s, target %.0f C, drive now %.1f C, peak %.1f C, reads held back %.2f s\n",
+                __func__, pfx, read_max_bps/1e9, temp_max, temp_mc.load()/1000.0, temp_peak_mc.load()/1000.0, t_pace_us.load()/1e6);
+    }
 
     print_locality(pfx);
 }
@@ -1343,14 +1876,19 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
                 // different questions - t_stall_us is time spent waiting on the disk, this is time
                 // spent waiting for the cache to give a slot back. they call for opposite fixes.
                 const int64_t t0 = ggml_time_us();
-                do {
-                    mgr->cv_done.wait(lk);
-                    if (mgr->load_failed) {
-                        GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
-                    }
-                } while ((v = mgr->pick_victim_locked(*sl, sl->keep.data())) < 0);
+                const bool got = mgr->wait_or_abort(lk, [&]{
+                    return mgr->load_failed || (v = mgr->pick_victim_locked(*sl, sl->keep.data())) >= 0;
+                });
+                if (mgr->load_failed) {
+                    GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+                }
                 mgr->stats.t_victim_us += ggml_time_us() - t0;
                 mgr->stats.n_victim_waits++;
+                if (!got) {
+                    // any in-range slot keeps the GEMM valid; the graph stops at the next node
+                    std::fill(out, out + n, 0);
+                    return;
+                }
             }
             if (!sl->seen[e]) {
                 mgr->stats.n_miss_cold++;
@@ -1371,7 +1909,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
 
     if (waited) {
         const int64_t t0 = ggml_time_us();
-        mgr->cv_done.wait(lk, [&]{
+        mgr->wait_or_abort(lk, [&]{
             if (mgr->load_failed) {
                 return true;
             }
@@ -1406,6 +1944,145 @@ llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint
         wave_ud.push_back(std::move(ud));
     }
     return wave_ud[wave].get();
+}
+
+// Measured 2026-09-24 on a PCIe 4.0 x4 NVMe: scattered 6 MiB O_DIRECT reads reach 7.4 GB/s with
+// two or more threads in flight, the same as 32 MiB sequential ones. What kept the
+// drive near 1 GB/s was the wave path handing it 18 reads, then waiting on an upload, a GPU sync
+// and a masked GEMM before handing it the next 18. So the sweep queues the layer's whole expert
+// set at once, in file order, and the GEMM runs once over all of it.
+void llama_moe_stream_sweep_ids(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+
+    auto * sl  = (llama_moe_stream_layer *) userdata;
+    auto * mgr = sl->mgr;
+
+    GGML_ASSERT(a->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_are_same_shape(a, dst));
+
+    const int64_t   n   = ggml_nelements(a);
+    const int32_t * ids = (const int32_t *) a->data;
+
+    // slot == expert id in the region, whether or not the loads finish
+    memcpy(dst->data, ids, n*sizeof(int32_t));
+
+    const int64_t t_start = ggml_time_us();
+
+    std::unique_lock<std::mutex> lk(mgr->mtx);
+
+    if (mgr->load_failed) {
+        GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+    }
+
+    mgr->stats.n_calls++;
+    mgr->stats.n_sweeps++;
+    mgr->start_workers_locked();
+
+    // distinct experts, ascending, which is file order within each weight tensor
+    sl->touched.assign(sl->n_expert, 0);
+    for (int64_t i = 0; i < n; i++) {
+        const int32_t e = ids[i];
+        GGML_ASSERT(e >= 0 && (uint32_t) e < sl->n_expert);
+        sl->touched[e] = 1;
+    }
+    sl->uniq.clear();
+    for (uint32_t e = 0; e < sl->n_expert; e++) {
+        if (sl->touched[e]) {
+            sl->uniq.push_back((int32_t) e);
+        }
+    }
+
+    for (const int32_t e : sl->uniq) {
+        sat_inc(sl->route_hotness[e]);
+        sl->route_total[e]++;
+        sl->seen[e] = 1;
+    }
+    if (mgr->hot_decay_interval > 0 && mgr->stats.n_calls % mgr->hot_decay_interval == 0) {
+        for (auto & sl2 : mgr->layers) {
+            if (sl2) {
+                for (auto & h : sl2->route_hotness) {
+                    h >>= 1;
+                }
+            }
+        }
+    }
+
+    mgr->sweep_begin_locked(lk);
+
+    const int64_t t_gap = mgr->t_sweep_end_us > 0 ? t_start - mgr->t_sweep_end_us : 0;
+    if (t_gap > 0 && t_gap < 10*1000*1000) {
+        mgr->stats.t_sweep_gap_us += t_gap; // between two layers of a batch, not across requests
+    }
+
+    // one item per slab, sorted by (file, offset) across every weight of the layer
+    struct slab { uint64_t key; int32_t expert; int32_t weight; };
+    std::vector<slab> order;
+    order.reserve(sl->uniq.size()*sl->weights.size());
+    for (size_t w = 0; w < sl->weights.size(); w++) {
+        const auto & wt = sl->weights[w];
+        for (const int32_t e : sl->uniq) {
+            const uint64_t key = ((uint64_t) wt.file_idx << 48) | (uint64_t) (wt.offs + (size_t) e*wt.nb_expert);
+            order.push_back({ key, e, (int32_t) w });
+        }
+    }
+    std::sort(order.begin(), order.end(), [](const slab & x, const slab & y) { return x.key < y.key; });
+
+    const uint64_t g = ++mgr->sweep_gen;
+    mgr->sweep_total = (int64_t) order.size();
+    mgr->sweep_done  = 0;
+    for (const auto & o : order) {
+        llama_moe_stream_work it;
+        it.sl     = sl;
+        it.expert = o.expert;
+        it.slot   = o.expert;
+        it.gen    = g;
+        it.weight = o.weight;
+        it.sweep  = true;
+        mgr->q_demand.push_back(it);
+    }
+    mgr->cv_work.notify_all();
+    mgr->stats.n_sweep_experts += (int64_t) sl->uniq.size();
+
+    mgr->trace_and_speculate_locked(*sl);
+
+    const int64_t n_l2_0   = mgr->stats.n_sweep_l2;
+    const int64_t t_wait_0 = ggml_time_us();
+    const bool done = mgr->wait_or_abort(lk, [&]{
+        return mgr->load_failed || mgr->sweep_done >= mgr->sweep_total;
+    });
+    if (mgr->load_failed) {
+        GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+    }
+    if (!done) {
+        mgr->sweep_cancel_locked();
+    }
+    const int64_t t_end = ggml_time_us();
+    mgr->stats.t_sweep_us += t_end - t_wait_0;
+    mgr->t_sweep_end_us    = t_end;
+
+    if (mgr->sweep_log) {
+        const int64_t n_l2   = mgr->stats.n_sweep_l2 - n_l2_0;
+        const int64_t n_disk = (int64_t) order.size() - n_l2;
+        const double  ms     = (t_end - t_wait_0)/1000.0;
+        const double  gb     = n_disk*(double) sl->weights[0].nb_expert/1e9;
+        char heat[48] = "";
+        if (mgr->temp_max > 0.0f) {
+            double pace = 0.0;
+            {
+                std::lock_guard<std::mutex> pl(mgr->pace_mtx);
+                pace = mgr->pace_bps;
+            }
+            snprintf(heat, sizeof(heat), "  drive %.0f C%s", mgr->temp_mc.load()/1000.0, pace > 0.0 ? " paced" : "");
+        }
+        LLAMA_LOG_WARN("moe sweep: layer %2d  tokens %4" PRId64 "  experts %3zu  slabs %4zu (host %4" PRId64 ")  "
+                "wait %7.1f ms  gap %6.1f ms  %.2f GB/s%s%s\n",
+                sl->il, (int64_t) a->ne[1], sl->uniq.size(), order.size(), n_l2,
+                ms, t_gap/1000.0, ms > 0 ? gb/(ms/1000.0) : 0.0, heat, done ? "" : "  ABORTED");
+    }
 }
 
 // wave 0 of a ubatch: record the distinct touched experts (sl.uniq, first-use order) and split them
@@ -1443,7 +2120,7 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
 // make wave w's expert slice (uniq[w*cap .. +count)) resident, waiting for its loads, and best-effort
 // preload the next wave so its loads overlap this wave's compute. leaves sl.demand_slots = this wave's
 // slots and sl.plan_pool = the resident parking pool (>= n_ids slots) the emit draws masked pairs from
-void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids) {
+bool llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids) {
     const size_t first = (size_t) w*sl.plan_capacity;
     const size_t count = first < sl.uniq.size() ? std::min<size_t>(sl.plan_capacity, sl.uniq.size() - first) : 0;
 
@@ -1493,12 +2170,15 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                 sl.demand_slots.push_back(s);
             } else {
                 // miss: evict a non-kept slot and queue the load
-                int32_t v;
-                while ((v = pick_victim_locked(sl, sl.keep.data())) < 0) {
-                    cv_done.wait(lk);
-                    if (load_failed) {
-                        GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
-                    }
+                int32_t v = -1;
+                const bool got = wait_or_abort(lk, [&]{
+                    return load_failed || (v = pick_victim_locked(sl, sl.keep.data())) >= 0;
+                });
+                if (load_failed) {
+                    GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+                }
+                if (!got) {
+                    return false;
                 }
                 if (!sl.seen[e]) {
                     stats.n_miss_cold++;
@@ -1537,7 +2217,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
 
     if (waited) {
         const int64_t t0 = ggml_time_us();
-        cv_done.wait(lk, [&]{
+        const bool got = wait_or_abort(lk, [&]{
             if (load_failed) {
                 return true;
             }
@@ -1552,6 +2232,9 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
             GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
         }
         stats.t_stall_wave_us += ggml_time_us() - t0;
+        if (!got) {
+            return false;
+        }
     }
 
     // parking pool: this wave's own resident slots plus the borrowed ones (all keep-protected;
@@ -1559,6 +2242,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
     sl.plan_pool = sl.demand_slots;
     sl.plan_pool.insert(sl.plan_pool.end(), borrowed.begin(), borrowed.end());
     GGML_ASSERT(sl.plan_pool.size() >= n_ids);
+    return true;
 }
 
 // write out[i] = the cache slot the GEMM should index for each (token, expert) pair of wave w, one
@@ -1644,7 +2328,12 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
 
     const uint32_t n_ids = (uint32_t) a->ne[0]; // experts per token (n_expert_used)
 
-    mgr->stage_wave_locked(lk, *sl, w, n_ids); // make this wave resident, preload the next, build the pool
+    // make this wave resident, preload the next, build the pool
+    if (!mgr->stage_wave_locked(lk, *sl, w, n_ids)) {
+        std::fill(out, out + n, 0); // aborted: any in-range slot, the graph stops at the next node
+        sl->plan_next_wave = w + 1;
+        return;
+    }
     sl->plan_next_wave = w + 1;
 
     mgr->emit_wave_slots(*sl, ids, out, w, n_ids, a->ne[1]);

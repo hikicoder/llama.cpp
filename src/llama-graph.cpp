@@ -1637,6 +1637,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     mstream          (params.mstream),
+    mstream_prefill  (params.mstream_prefill),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2205,15 +2206,39 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_masked", il);
     }
 
+    // Prefill (more than one token) uses the host-RAM expert cache. Decode keeps the device
+    // cache passed in by the model, which is what mstream was constructed with.
+    llama_moe_stream * stream = (n_tokens > 1 && mstream_prefill) ? mstream_prefill : mstream;
+    if (n_tokens > 1 && mstream_prefill) {
+        llama_moe_stream_layer * hsl = mstream_prefill->layer(il);
+        if (hsl) {
+            auto to_host = [&](ggml_tensor * t) -> ggml_tensor * {
+                if (t == nullptr || t->name == nullptr) {
+                    return t;
+                }
+                for (const auto & w : hsl->weights) {
+                    if (w.cache && w.cache->name && strcmp(t->name, w.cache->name) == 0) {
+                        return w.cache;
+                    }
+                }
+                return t;
+            };
+            gate_exps     = to_host(gate_exps);
+            up_exps       = to_host(up_exps);
+            down_exps     = to_host(down_exps);
+            gate_up_exps  = to_host(gate_up_exps);
+        }
+    }
+
     // MoE expert streaming: optionally bias the router toward experts the cache already holds,
     //   before top-k decides. Off unless LLAMA_MOE_STREAM_ROUTE_BIAS is set; at 0 the hook is not
     //   built at all, so the default path stays bit-identical. This deliberately changes which
     //   experts are selected - it is a measurement instrument for trading routing fidelity against
     //   residency, not a default.
-    if (mstream) {
-        llama_moe_stream_layer * msl_bias = mstream->layer(il);
+    if (stream) {
+        llama_moe_stream_layer * msl_bias = stream->layer(il);
         if (msl_bias && msl_bias->matches(gate_exps, up_exps, down_exps, gate_up_exps) &&
-                mstream->route_bias != 0.0f) {
+                stream->route_bias != 0.0f) {
             selection_probs = ggml_map_custom1(ctx0, ggml_cont(ctx0, selection_probs),
                     llama_moe_stream_route_bias, 1, msl_bias); // [n_expert, n_tokens]
             cb(selection_probs, "ffn_moe_probs_cache_biased", il);
@@ -2273,7 +2298,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // MoE expert streaming: make the selected experts cache-resident and remap the ids fed to the
     //   expert GEMMs to cache slots; the routing itself (weights, scales, biases) keeps the original ids
-    llama_moe_stream_layer * msl = mstream ? mstream->layer(il) : nullptr;
+    llama_moe_stream_layer * msl = stream ? stream->layer(il) : nullptr;
     if (msl && !msl->matches(gate_exps, up_exps, down_exps, gate_up_exps)) {
         msl = nullptr; // a different expert group of the same layer (e.g. grovemoe chexps), not streamed
     }
@@ -2286,16 +2311,32 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //   numbers to size its node budget and the two used to compute them separately
     uint32_t n_stream_waves  = 1;
     uint32_t stream_wave_cap = 0;
+    bool     stream_sweep    = false;
     if (msl) {
         // JigSaw: slots pinados nao sao reclamaveis pela vaga - o plano ve so os dinamicos
-        const llama_moe_stream_wave_budget wb = llama_moe_stream_wave_plan(
-                msl->n_slots - msl->mgr->pin_budget, (uint32_t) n_expert, (uint32_t) n_expert_used, (uint32_t) n_tokens);
-        n_stream_waves  = wb.n_waves;
-        stream_wave_cap = wb.cap;
+        const uint32_t n_dyn       = msl->n_slots - msl->mgr->pin_budget;
+        const uint64_t n_touch_max = std::min<uint64_t>((uint64_t) n_expert, (uint64_t) n_tokens*n_expert_used);
+        if (n_touch_max > n_dyn && msl->mgr->sweep_enabled) {
+            // the whole ubatch's expert set fits the pooled region: one pass, no waves
+            stream_sweep = true;
+        } else {
+            const llama_moe_stream_wave_budget wb = llama_moe_stream_wave_plan(
+                    n_dyn, (uint32_t) n_expert, (uint32_t) n_expert_used, (uint32_t) n_tokens);
+            n_stream_waves  = wb.n_waves;
+            stream_wave_cap = wb.cap;
+        }
     }
 
     ggml_tensor * ids_gemm = selected_experts;
-    if (msl && n_stream_waves == 1) {
+    if (stream_sweep) {
+        ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts);
+        ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_sweep_ids, 1, msl);
+        cb(ids_gemm, "ffn_moe_topk_sweep", il);
+        gate_exps    = msl->region_of(gate_exps);
+        up_exps      = msl->region_of(up_exps);
+        down_exps    = msl->region_of(down_exps);
+        gate_up_exps = msl->region_of(gate_up_exps);
+    } else if (msl && n_stream_waves == 1) {
         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
         ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
         cb(ids_gemm, "ffn_moe_topk_stream", il);
@@ -2764,6 +2805,15 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+// LLAMA_ATTN_CHUNK_MIB: cap on one non-flash attention score matrix, in MiB (0 = never chunk)
+static int64_t llm_graph_attn_chunk_mib() {
+    static const int64_t v = [] {
+        const char * s = std::getenv("LLAMA_ATTN_CHUNK_MIB");
+        return s ? (int64_t) std::strtoll(s, nullptr, 10) : (int64_t) 1024;
+    }();
+    return v;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2830,65 +2880,99 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
-        cb(kq, "kq", il);
-
-        // note: this op tends to require high floating point range
-        //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-
-        if (arch == LLM_ARCH_GROK) {
-            // need to do the following:
-            // multiply by attn_output_multiplier
-            // and then :
-            // kq = 30 * tanh(kq / 30)
-            // before the softmax below
-
-            kq = ggml_tanh(ctx0, ggml_scale(ctx0, kq, hparams.f_attn_out_scale / hparams.f_attn_logit_softcapping));
-            cb(kq, "kq_tanh", il);
-            kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled", il);
-        }
-
-        if (hparams.attn_soft_cap) {
-            kq = ggml_scale(ctx0, kq, 1.0f / hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled_1", il);
-            kq = ggml_tanh (ctx0, kq);
-            cb(kq, "kq_tanh", il);
-            kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled_2", il);
-        }
-
-        if (kq_b) {
-            kq = ggml_add(ctx0, kq, kq_b);
-            cb(kq, "kq_plus_kq_b", il);
-        }
-
-        kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
-        ggml_soft_max_add_sinks(kq, sinks);
-        cb(kq, "kq_soft_max", il);
-
         if (!v_trans) {
             // note: avoid this branch
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
             cb(v, "v_cont", il);
         }
 
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
-        cb(kqv, "kqv", il);
+        auto build_kqv = [&](ggml_tensor * q_c, ggml_tensor * mask_c) -> ggml_tensor * {
+            ggml_tensor * kq = ggml_mul_mat(ctx0, k, q_c);
+            cb(kq, "kq", il);
 
-        // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
-        if (v_mla) {
-            kqv = ggml_mul_mat(ctx0, v_mla, kqv);
-            cb(kqv, "kqv_mla", il);
+            // note: this op tends to require high floating point range
+            //       while for some models F16 is enough, for others it is not, so we default to F32 here
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+
+            if (arch == LLM_ARCH_GROK) {
+                // need to do the following:
+                // multiply by attn_output_multiplier
+                // and then :
+                // kq = 30 * tanh(kq / 30)
+                // before the softmax below
+
+                kq = ggml_tanh(ctx0, ggml_scale(ctx0, kq, hparams.f_attn_out_scale / hparams.f_attn_logit_softcapping));
+                cb(kq, "kq_tanh", il);
+                kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
+                cb(kq, "kq_scaled", il);
+            }
+
+            if (hparams.attn_soft_cap) {
+                kq = ggml_scale(ctx0, kq, 1.0f / hparams.f_attn_logit_softcapping);
+                cb(kq, "kq_scaled_1", il);
+                kq = ggml_tanh (ctx0, kq);
+                cb(kq, "kq_tanh", il);
+                kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
+                cb(kq, "kq_scaled_2", il);
+            }
+
+            if (kq_b) {
+                kq = ggml_add(ctx0, kq, kq_b);
+                cb(kq, "kq_plus_kq_b", il);
+            }
+
+            kq = ggml_soft_max_ext(ctx0, kq, mask_c, kq_scale, hparams.f_max_alibi_bias);
+            ggml_soft_max_add_sinks(kq, sinks);
+            cb(kq, "kq_soft_max", il);
+
+            ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+            cb(kqv, "kqv", il);
+
+            // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
+            if (v_mla) {
+                kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+                cb(kqv, "kqv_mla", il);
+            }
+
+            ggml_tensor * out = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+
+            // recombine streams
+            return ggml_cont_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]*out->ne[3]);
+        };
+
+        // The score matrix is n_kv x n_tokens x n_head in F32. Against a long context it dwarfs the
+        // rest of the graph (4 GiB per layer at 32k context, 64 heads, 512 tokens), which is what
+        // capped the ubatch. Queries are independent rows, so they run in chunks whose scores fit
+        // the budget; each chunk's scores are freed before the next chunk allocates its own.
+        const int64_t n_q      = q->ne[1];
+        const int64_t chunk_mb = llm_graph_attn_chunk_mib();
+        const size_t  per_q    = (size_t) k->ne[1]*q->ne[2]*sizeof(float);
+        const size_t  budget   = (size_t) chunk_mb*1024*1024;
+        int64_t       q_chunk  = n_q;
+        if (chunk_mb > 0 && n_stream == 1 && kq_b == nullptr && per_q*n_q > budget) {
+            q_chunk = std::max<int64_t>(16, (int64_t) (budget/per_q) & ~(int64_t) 15);
         }
 
-        cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+        if (q_chunk < n_q) {
+            cur = nullptr;
+            for (int64_t t0 = 0; t0 < n_q; t0 += q_chunk) {
+                const int64_t nc = std::min(q_chunk, n_q - t0);
+                ggml_tensor * q_c = ggml_view_4d(ctx0, q, q->ne[0], nc, q->ne[2], q->ne[3],
+                        q->nb[1], q->nb[2], q->nb[3], t0*q->nb[1]);
+                ggml_tensor * m_c = kq_mask == nullptr ? nullptr :
+                        ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], nc, kq_mask->ne[2], kq_mask->ne[3],
+                                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], t0*kq_mask->nb[1]);
+                ggml_tensor * part = build_kqv(q_c, m_c);
+                cur = cur == nullptr ? part : ggml_concat(ctx0, cur, part, 1);
+                ggml_build_forward_expand(gf, cur);
+            }
+        } else {
+            cur = build_kqv(q, kq_mask);
+        }
 
-        // recombine streams
-        cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
-
-        if (!cparams.offload_kqv) {
+        // Chunked scores are already bounded in device memory, which is what the CPU pin exists
+        // for; pinning the concat chain to the CPU would copy every chunk across the bus twice.
+        if (!cparams.offload_kqv && q_chunk == n_q) {
             // all nodes between the KV store and the attention output are run on the CPU
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         }
