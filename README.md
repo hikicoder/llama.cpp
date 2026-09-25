@@ -1,4 +1,4 @@
-# dsv41-ada-medvram: faster prefill for DeepSeek-V4.1-Flash on a ~20 GB GPU
+# dsv41-ampere-medvram: faster prefill for DeepSeek-V4.1-Flash on a ~20 GB GPU
 
 This branch is a fork of [JigSawPT/llama.cpp](https://github.com/JigSawPT/llama.cpp), branch
 `dsv41-porte`, which runs DeepSeek-V4.1-Flash (552B MoE) by streaming its experts from NVMe. All
